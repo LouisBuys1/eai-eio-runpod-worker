@@ -1,0 +1,313 @@
+"""LTX/Sulphur generation through Diffusers."""
+
+from __future__ import annotations
+
+from inspect import signature
+from pathlib import Path
+from typing import Any
+import os
+
+from eai_eio_runpod_sulphur_worker.config import load_config
+from eai_eio_runpod_sulphur_worker.contract import WorkerInput
+
+
+class LtxDiffusersGenerator:
+    def __init__(self) -> None:
+        self._pipe_by_model: dict[tuple[str, str], Any] = {}
+
+    def generate(
+        self,
+        request: WorkerInput,
+        image_path: Path | None,
+        output_path: Path,
+        *,
+        first_frame_path: Path | None = None,
+        middle_frame_path: Path | None = None,
+        last_frame_path: Path | None = None,
+    ) -> dict[str, Any]:
+        pipeline_kind = self._pipeline_kind(image_path, first_frame_path, middle_frame_path, last_frame_path)
+        pipe = self._load_pipeline(request.model_id, pipeline_kind)
+        call_kwargs = self._build_call_kwargs(request, image_path, first_frame_path, middle_frame_path, last_frame_path, pipe=pipe)
+        result = pipe(**call_kwargs)
+        frames = self._extract_frames(result)
+        self._export_video(frames, output_path, fps=request.fps)
+        return {
+            "backend": "diffusers",
+            "call_kwargs": sorted(call_kwargs.keys()),
+            "pipeline_kind": pipeline_kind,
+            "frame_count": len(frames) if hasattr(frames, "__len__") else None,
+            "first_frame_control": first_frame_path is not None,
+            "middle_frame_control": middle_frame_path is not None,
+            "last_frame_control": last_frame_path is not None,
+            "multi_keyframe_control": first_frame_path is not None and middle_frame_path is not None and last_frame_path is not None,
+        }
+
+    def _load_pipeline(self, model_id: str, pipeline_kind: str) -> Any:
+        cache_key = (model_id, pipeline_kind)
+        cached = self._pipe_by_model.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            import torch
+            _patch_torch_dynamo_compat()
+            try:
+                from diffusers import LTX2ImageToVideoPipeline
+            except Exception:
+                try:
+                    from diffusers.pipelines.ltx2.pipeline_ltx2_image2video import LTX2ImageToVideoPipeline
+                except Exception:
+                    LTX2ImageToVideoPipeline = None
+            try:
+                from diffusers import LTX2Pipeline
+            except Exception:
+                try:
+                    from diffusers.pipelines.ltx2.pipeline_ltx2 import LTX2Pipeline
+                except Exception:
+                    LTX2Pipeline = None
+            try:
+                from diffusers import LTX2ConditionPipeline
+            except Exception:
+                LTX2ConditionPipeline = None
+        except Exception as exc:
+            raise RuntimeError(
+                "Diffusers/Torch dependencies are not installed. Build the RunPod Docker image before running real generation."
+            ) from exc
+
+        config = load_config()
+        config.model_cache_dir.mkdir(parents=True, exist_ok=True)
+        dtype = torch.bfloat16 if os.environ.get("EAI_EIO_DTYPE", "bfloat16") == "bfloat16" else torch.float16
+        pipeline_class = self._pipeline_class_for_model(
+            model_id,
+            pipeline_kind,
+            LTX2Pipeline,
+            LTX2ImageToVideoPipeline,
+            LTX2ConditionPipeline,
+        )
+        if pipeline_class is None:
+            from diffusers import DiffusionPipeline
+
+            pipeline_class = DiffusionPipeline
+        from_pretrained_kwargs: dict[str, Any] = {
+            "cache_dir": str(config.model_cache_dir),
+        }
+        device_map = os.environ.get("EAI_EIO_DEVICE_MAP", "").strip()
+        if device_map:
+            from_pretrained_kwargs["device_map"] = device_map
+        try:
+            pipe = pipeline_class.from_pretrained(model_id, dtype=dtype, **from_pretrained_kwargs)
+        except TypeError:
+            pipe = pipeline_class.from_pretrained(model_id, torch_dtype=dtype, **from_pretrained_kwargs)
+
+        device = os.environ.get("EAI_EIO_DEVICE", "cuda")
+        vae = getattr(pipe, "vae", None)
+        if os.environ.get("EAI_EIO_ENABLE_VAE_TILING", "1") != "0" and hasattr(vae, "enable_tiling"):
+            vae.enable_tiling()
+        if not device_map:
+            if os.environ.get("EAI_EIO_ENABLE_CPU_OFFLOAD", "1") != "0" and hasattr(pipe, "enable_model_cpu_offload"):
+                pipe.enable_model_cpu_offload(device=device)
+            elif hasattr(pipe, "to"):
+                pipe.to(device)
+        self._pipe_by_model[cache_key] = pipe
+        return pipe
+
+    def _build_call_kwargs(
+        self,
+        request: WorkerInput,
+        image_path: Path | None,
+        first_frame_path: Path | None,
+        middle_frame_path: Path | None,
+        last_frame_path: Path | None,
+        *,
+        pipe: Any,
+    ) -> dict[str, Any]:
+        num_frames = _compute_frame_count(request.duration_seconds, request.fps)
+        kwargs: dict[str, Any] = {
+            "prompt": request.prompt,
+            "height": request.height,
+            "width": request.width,
+            "num_frames": num_frames,
+            "frame_rate": float(request.fps),
+            "fps": request.fps,
+        }
+        self._apply_model_call_defaults(kwargs, request.model_id)
+        if request.seed is not None:
+            kwargs["generator"] = self._make_torch_generator(request.seed)
+        if first_frame_path is not None or middle_frame_path is not None or last_frame_path is not None:
+            if first_frame_path is None or last_frame_path is None:
+                raise RuntimeError("Strict first/last-frame generation requires both first_frame and last_frame.")
+            kwargs.update(self._build_condition_frame_kwargs(pipe, first_frame_path, middle_frame_path, last_frame_path, num_frames))
+        elif image_path is not None:
+            from diffusers.utils import load_image
+
+            kwargs["image"] = load_image(str(image_path))
+        return self._filter_supported_kwargs(pipe, kwargs)
+
+    def _build_condition_frame_kwargs(
+        self,
+        pipe: Any,
+        first_frame_path: Path,
+        middle_frame_path: Path | None,
+        last_frame_path: Path,
+        num_frames: int,
+    ) -> dict[str, Any]:
+        from diffusers.utils import load_image
+
+        condition_frames: list[tuple[Any, int, float]] = [
+            (load_image(str(first_frame_path)), 0, 1.0),
+        ]
+        if middle_frame_path is not None:
+            condition_frames.append((load_image(str(middle_frame_path)), _middle_frame_index(num_frames), 0.92))
+        condition_frames.append((load_image(str(last_frame_path)), -1, 1.0))
+
+        supported = self._supported_call_kwargs(pipe)
+
+        if "conditions" in supported or "*" in supported:
+            try:
+                from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
+
+                return {
+                    "conditions": [
+                        LTX2VideoCondition(frames=image, index=index, strength=strength)
+                        for image, index, strength in condition_frames
+                    ],
+                }
+            except Exception:
+                pass
+
+        if ("image" in supported or "*" in supported) and ("frame_index" in supported or "*" in supported):
+            return {
+                "image": [image for image, _, _ in condition_frames],
+                "frame_index": [index for _, index, _ in condition_frames],
+                "strength": [strength for _, _, strength in condition_frames],
+            }
+
+        raise RuntimeError("Selected Diffusers pipeline does not expose multi-keyframe conditioning controls.")
+
+    def _filter_supported_kwargs(self, pipe: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+        supported = self._supported_call_kwargs(pipe)
+        if "*" in supported:
+            return kwargs
+        return {key: value for key, value in kwargs.items() if key in supported}
+
+    def _supported_call_kwargs(self, pipe: Any) -> set[str]:
+        if pipe is None or not hasattr(pipe, "__call__"):
+            return {"*"}
+        call_signature = signature(pipe.__call__)
+        if any(parameter.kind == parameter.VAR_KEYWORD for parameter in call_signature.parameters.values()):
+            return {"*"}
+        return set(call_signature.parameters)
+
+    def _make_torch_generator(self, seed: int) -> Any:
+        try:
+            import torch
+        except Exception as exc:
+            raise RuntimeError("Torch is required for seeded generation.") from exc
+        return torch.Generator(device=os.environ.get("EAI_EIO_DEVICE", "cuda")).manual_seed(seed)
+
+    def _extract_frames(self, result: Any) -> Any:
+        if isinstance(result, tuple) and result:
+            result = result[0]
+        shape = getattr(result, "shape", None)
+        if shape is not None and len(shape) == 5:
+            return result[0]
+        if isinstance(result, list) and result:
+            return result[0] if isinstance(result[0], list) else result
+        frames = getattr(result, "frames", None)
+        if isinstance(frames, list) and frames:
+            return frames[0]
+        if isinstance(result, dict):
+            frames_value = result.get("frames")
+            if isinstance(frames_value, list) and frames_value:
+                return frames_value[0]
+        raise RuntimeError("Diffusers pipeline did not return frames.")
+
+    def _export_video(self, frames: Any, output_path: Path, *, fps: int) -> None:
+        from diffusers.utils import export_to_video
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        export_to_video(frames, str(output_path), fps=fps)
+
+    def _pipeline_kind(
+        self,
+        image_path: Path | None,
+        first_frame_path: Path | None,
+        middle_frame_path: Path | None,
+        last_frame_path: Path | None,
+    ) -> str:
+        if first_frame_path is not None or middle_frame_path is not None or last_frame_path is not None:
+            return "condition"
+        if image_path is not None:
+            return "image"
+        return "text"
+
+    def _pipeline_class_for_model(
+        self,
+        model_id: str,
+        pipeline_kind: str,
+        ltx2_pipeline: Any,
+        ltx2_image_to_video_pipeline: Any,
+        ltx2_condition_pipeline: Any,
+    ) -> Any:
+        if "ltx-2" not in model_id.lower():
+            return None
+        if pipeline_kind == "condition":
+            return ltx2_condition_pipeline or ltx2_pipeline
+        if pipeline_kind == "image":
+            return ltx2_image_to_video_pipeline
+        return ltx2_pipeline
+
+    def _apply_model_call_defaults(self, kwargs: dict[str, Any], model_id: str) -> None:
+        normalized_model_id = model_id.lower()
+        if "ltx-2" not in normalized_model_id:
+            return
+
+        kwargs.setdefault("output_type", os.environ.get("EAI_EIO_OUTPUT_TYPE", "np"))
+        kwargs.setdefault("return_dict", False)
+
+        if "distilled" not in normalized_model_id:
+            return
+
+        kwargs.setdefault("num_inference_steps", int(os.environ.get("EAI_EIO_NUM_INFERENCE_STEPS", "8")))
+        kwargs.setdefault("guidance_scale", float(os.environ.get("EAI_EIO_GUIDANCE_SCALE", "1.0")))
+        try:
+            from diffusers.pipelines.ltx2.utils import DEFAULT_NEGATIVE_PROMPT, DISTILLED_SIGMA_VALUES
+
+            kwargs.setdefault("negative_prompt", os.environ.get("EAI_EIO_NEGATIVE_PROMPT", DEFAULT_NEGATIVE_PROMPT))
+            kwargs.setdefault("sigmas", DISTILLED_SIGMA_VALUES)
+        except Exception:
+            pass
+
+
+def _compute_frame_count(duration_seconds: float, fps: int) -> int:
+    raw_frame_count = max(1, round(duration_seconds * fps))
+    remainder = (raw_frame_count - 1) % 8
+    return raw_frame_count if remainder == 0 else raw_frame_count + (8 - remainder)
+
+
+def _middle_frame_index(num_frames: int) -> int:
+    if num_frames <= 1:
+        return 0
+    midpoint = max(1, min(num_frames - 2, num_frames // 2))
+    candidates = list(range(8, max(8, num_frames - 1), 8))
+    interior_candidates = [index for index in candidates if 0 < index < num_frames - 1]
+    if interior_candidates:
+        return min(interior_candidates, key=lambda index: (abs(index - midpoint), -index))
+    return midpoint
+
+
+def _identity_decorator(fn: Any = None, *args: Any, **kwargs: Any) -> Any:
+    if fn is None:
+        return lambda inner: inner
+    return fn
+
+
+def _patch_torch_dynamo_compat() -> None:
+    try:
+        import torch._dynamo as torch_dynamo
+
+        for name in ("assume_constant_result", "mark_static_address"):
+            if not hasattr(torch_dynamo, name):
+                setattr(torch_dynamo, name, _identity_decorator)
+    except Exception:
+        pass
