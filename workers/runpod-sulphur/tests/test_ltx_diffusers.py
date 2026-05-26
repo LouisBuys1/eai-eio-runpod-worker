@@ -29,9 +29,10 @@ class LtxDiffusersTests(unittest.TestCase):
         self.assertEqual(_compute_frame_count(1, 8), 9)
 
     def test_middle_frame_index_prefers_interior_ltx_condition_slot(self) -> None:
-        self.assertEqual(_middle_frame_index(145), 72)
-        self.assertEqual(_middle_frame_index(25), 16)
-        self.assertEqual(_middle_frame_index(9), 4)
+        self.assertEqual(_middle_frame_index(145), 9)
+        self.assertEqual(_middle_frame_index(121), 8)
+        self.assertEqual(_middle_frame_index(25), 2)
+        self.assertEqual(_middle_frame_index(9), 1)
 
     def test_resolves_runpod_cached_model_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

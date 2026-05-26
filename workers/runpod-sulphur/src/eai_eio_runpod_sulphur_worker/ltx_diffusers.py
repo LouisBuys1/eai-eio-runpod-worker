@@ -389,14 +389,16 @@ def _compute_frame_count(duration_seconds: float, fps: int) -> int:
 
 
 def _middle_frame_index(num_frames: int) -> int:
-    if num_frames <= 1:
+    latent_frame_count = _latent_frame_count(num_frames)
+    if latent_frame_count <= 1:
         return 0
-    midpoint = max(1, min(num_frames - 2, num_frames // 2))
-    candidates = list(range(8, max(8, num_frames - 1), 8))
-    interior_candidates = [index for index in candidates if 0 < index < num_frames - 1]
-    if interior_candidates:
-        return min(interior_candidates, key=lambda index: (abs(index - midpoint), -index))
-    return midpoint
+    if latent_frame_count <= 2:
+        return 1
+    return max(1, min(latent_frame_count - 2, latent_frame_count // 2))
+
+
+def _latent_frame_count(num_frames: int) -> int:
+    return max(1, ((max(1, num_frames) - 1) // 8) + 1)
 
 
 def _identity_decorator(fn: Any = None, *args: Any, **kwargs: Any) -> Any:
