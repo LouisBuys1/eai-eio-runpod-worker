@@ -14,7 +14,7 @@ dependencies = [
   "requests>=2.32.0",
   "runpod>=1.7.0",
   "safetensors==0.8.0rc0",
-  "torch>=2.8,<2.10",
+  "torch==2.9.1",
   "transformers>=4.51.0",
 ]
 
