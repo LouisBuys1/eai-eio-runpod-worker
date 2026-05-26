@@ -118,9 +118,9 @@ class LtxDiffusersGenerator:
         if device_map:
             from_pretrained_kwargs["device_map"] = device_map
         try:
-            pipe = pipeline_class.from_pretrained(str(model_ref or model_id), dtype=dtype, **from_pretrained_kwargs)
-        except TypeError:
             pipe = pipeline_class.from_pretrained(str(model_ref or model_id), torch_dtype=dtype, **from_pretrained_kwargs)
+        except TypeError:
+            pipe = pipeline_class.from_pretrained(str(model_ref or model_id), dtype=dtype, **from_pretrained_kwargs)
 
         device = os.environ.get("EAI_EIO_DEVICE", "cuda")
         vae = getattr(pipe, "vae", None)
