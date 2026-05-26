@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 import json
+import os
+import threading
 import traceback
 
 from eai_eio_runpod_sulphur_worker.contract import handle_job
@@ -11,11 +13,20 @@ from eai_eio_runpod_sulphur_worker.contract import handle_job
 
 def runpod_handler(job: dict[str, Any]) -> dict[str, Any]:
     def progress(phase: str, metadata: dict[str, Any]) -> None:
-        try:
-            import runpod
+        if os.environ.get("EAI_EIO_ENABLE_RUNPOD_PROGRESS", "0").strip().lower() not in {"1", "true", "yes"}:
+            return
 
-            payload = {"phase": phase, **metadata}
-            runpod.serverless.progress_update(job, json.dumps(payload, separators=(",", ":")))
+        def send_progress() -> None:
+            try:
+                import runpod
+
+                payload = {"phase": phase, **metadata}
+                runpod.serverless.progress_update(job, json.dumps(payload, separators=(",", ":")))
+            except Exception:
+                pass
+
+        try:
+            threading.Thread(target=send_progress, daemon=True).start()
         except Exception:
             pass
 
