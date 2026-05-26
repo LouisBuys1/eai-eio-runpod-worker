@@ -33,6 +33,7 @@ class FakeGenerator:
         first_frame_path: Path | None = None,
         middle_frame_path: Path | None = None,
         last_frame_path: Path | None = None,
+        progress=None,
     ) -> dict[str, object]:
         self.last_request = request
         self.last_image_path = image_path
@@ -51,6 +52,8 @@ def make_config(output_dir: Path) -> WorkerConfig:
     return WorkerConfig(
         default_model_id="diffusers/LTX-2.3-Distilled-Diffusers",
         model_cache_dir=output_dir / "models",
+        persistent_model_cache_dir=output_dir / "persistent-models",
+        runpod_cached_model_hub=output_dir / "runpod-cache" / "hub",
         output_dir=output_dir,
         output_mode="base64",
         s3_endpoint_url="",

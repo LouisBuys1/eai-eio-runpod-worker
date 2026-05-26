@@ -6,9 +6,12 @@ from inspect import signature
 from pathlib import Path
 from typing import Any
 import os
+import shutil
 
 from eai_eio_runpod_sulphur_worker.config import load_config
-from eai_eio_runpod_sulphur_worker.contract import WorkerInput
+from eai_eio_runpod_sulphur_worker.contract import ProgressCallback, WorkerInput
+
+MIN_MODEL_CACHE_FREE_BYTES = 80 * 1024 * 1024 * 1024
 
 
 class LtxDiffusersGenerator:
@@ -24,15 +27,21 @@ class LtxDiffusersGenerator:
         first_frame_path: Path | None = None,
         middle_frame_path: Path | None = None,
         last_frame_path: Path | None = None,
+        progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         pipeline_kind = self._pipeline_kind(image_path, first_frame_path, middle_frame_path, last_frame_path)
-        pipe = self._load_pipeline(request.model_id, pipeline_kind)
+        self._emit_progress(progress, "loading_pipeline", {"pipeline_kind": pipeline_kind, "model_id": request.model_id})
+        pipe, load_metadata = self._load_pipeline(request.model_id, pipeline_kind)
+        self._emit_progress(progress, "building_request", {"pipeline_kind": pipeline_kind})
         call_kwargs = self._build_call_kwargs(request, image_path, first_frame_path, middle_frame_path, last_frame_path, pipe=pipe)
+        self._emit_progress(progress, "running_inference", {"pipeline_kind": pipeline_kind, "frame_count": call_kwargs.get("num_frames")})
         result = pipe(**call_kwargs)
         frames = self._extract_frames(result)
+        self._emit_progress(progress, "exporting_video", {"frame_count": len(frames) if hasattr(frames, "__len__") else None})
         self._export_video(frames, output_path, fps=request.fps)
         return {
             "backend": "diffusers",
+            **load_metadata,
             "call_kwargs": sorted(call_kwargs.keys()),
             "pipeline_kind": pipeline_kind,
             "frame_count": len(frames) if hasattr(frames, "__len__") else None,
@@ -42,11 +51,11 @@ class LtxDiffusersGenerator:
             "multi_keyframe_control": first_frame_path is not None and middle_frame_path is not None and last_frame_path is not None,
         }
 
-    def _load_pipeline(self, model_id: str, pipeline_kind: str) -> Any:
+    def _load_pipeline(self, model_id: str, pipeline_kind: str) -> tuple[Any, dict[str, Any]]:
         cache_key = (model_id, pipeline_kind)
         cached = self._pipe_by_model.get(cache_key)
         if cached is not None:
-            return cached
+            return cached, {"model_cache_hit": True, "model_id": model_id}
 
         try:
             import torch
@@ -75,7 +84,15 @@ class LtxDiffusersGenerator:
             ) from exc
 
         config = load_config()
-        config.model_cache_dir.mkdir(parents=True, exist_ok=True)
+        model_cache_dir = self._select_model_cache_dir(config.model_cache_dir, config.persistent_model_cache_dir)
+        model_cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_HOME", str(model_cache_dir / "hf-home"))
+        os.environ.setdefault("HF_HUB_CACHE", str(model_cache_dir))
+        os.environ.setdefault("HF_XET_CACHE", str(model_cache_dir / "xet"))
+        model_ref = self._resolve_cached_snapshot(model_id, config.runpod_cached_model_hub)
+        cache_free_bytes = self._free_bytes(model_cache_dir)
+        if model_ref is None:
+            self._ensure_model_cache_has_room(model_cache_dir, cache_free_bytes)
         dtype = torch.bfloat16 if os.environ.get("EAI_EIO_DTYPE", "bfloat16") == "bfloat16" else torch.float16
         pipeline_class = self._pipeline_class_for_model(
             model_id,
@@ -89,15 +106,15 @@ class LtxDiffusersGenerator:
 
             pipeline_class = DiffusionPipeline
         from_pretrained_kwargs: dict[str, Any] = {
-            "cache_dir": str(config.model_cache_dir),
+            "cache_dir": str(model_cache_dir),
         }
         device_map = os.environ.get("EAI_EIO_DEVICE_MAP", "").strip()
         if device_map:
             from_pretrained_kwargs["device_map"] = device_map
         try:
-            pipe = pipeline_class.from_pretrained(model_id, dtype=dtype, **from_pretrained_kwargs)
+            pipe = pipeline_class.from_pretrained(str(model_ref or model_id), dtype=dtype, **from_pretrained_kwargs)
         except TypeError:
-            pipe = pipeline_class.from_pretrained(model_id, torch_dtype=dtype, **from_pretrained_kwargs)
+            pipe = pipeline_class.from_pretrained(str(model_ref or model_id), torch_dtype=dtype, **from_pretrained_kwargs)
 
         device = os.environ.get("EAI_EIO_DEVICE", "cuda")
         vae = getattr(pipe, "vae", None)
@@ -109,7 +126,64 @@ class LtxDiffusersGenerator:
             elif hasattr(pipe, "to"):
                 pipe.to(device)
         self._pipe_by_model[cache_key] = pipe
-        return pipe
+        return pipe, {
+            "model_cache_hit": False,
+            "model_id": model_id,
+            "model_ref": str(model_ref or model_id),
+            "model_cache_dir": str(model_cache_dir),
+            "model_cache_free_bytes_at_start": cache_free_bytes,
+            "runpod_cached_model_hit": model_ref is not None,
+        }
+
+    def _select_model_cache_dir(self, requested_cache_dir: Path, persistent_cache_dir: Path) -> Path:
+        if str(requested_cache_dir).startswith("/runpod-volume"):
+            return requested_cache_dir
+        runpod_volume = Path("/runpod-volume")
+        if runpod_volume.exists():
+            return persistent_cache_dir
+        return requested_cache_dir
+
+    def _resolve_cached_snapshot(self, model_id: str, cached_model_hub: Path) -> Path | None:
+        if "/" not in model_id or Path(model_id).exists():
+            return None
+        snapshots_dir = cached_model_hub / f"models--{model_id.replace('/', '--')}" / "snapshots"
+        if not snapshots_dir.exists():
+            return None
+        ref_path = snapshots_dir.parent / "refs" / "main"
+        if ref_path.exists():
+            revision = ref_path.read_text(encoding="utf-8").strip()
+            ref_snapshot = snapshots_dir / revision
+            if self._looks_like_diffusers_snapshot(ref_snapshot):
+                return ref_snapshot
+        snapshots = [path for path in snapshots_dir.iterdir() if path.is_dir()]
+        valid_snapshots = [path for path in snapshots if self._looks_like_diffusers_snapshot(path)]
+        if not valid_snapshots:
+            return None
+        return max(valid_snapshots, key=lambda path: path.stat().st_mtime)
+
+    def _looks_like_diffusers_snapshot(self, path: Path) -> bool:
+        return path.is_dir() and (path / "model_index.json").exists()
+
+    def _free_bytes(self, path: Path) -> int | None:
+        try:
+            return shutil.disk_usage(str(path)).free
+        except Exception:
+            return None
+
+    def _ensure_model_cache_has_room(self, model_cache_dir: Path, free_bytes: int | None) -> None:
+        default_min_free_gb = str(MIN_MODEL_CACHE_FREE_BYTES / (1024 ** 3))
+        min_free_bytes = int(
+            float(os.environ.get("EAI_EIO_MIN_MODEL_CACHE_FREE_GB", default_min_free_gb))
+            * 1024
+            * 1024
+            * 1024
+        )
+        if free_bytes is None or free_bytes >= min_free_bytes:
+            return
+        raise RuntimeError(
+            f"Model cache path {model_cache_dir} has {free_bytes / (1024 ** 3):.1f} GiB free; "
+            f"at least {min_free_bytes / (1024 ** 3):.0f} GiB is required before downloading LTX-2.3."
+        )
 
     def _build_call_kwargs(
         self,
@@ -142,6 +216,11 @@ class LtxDiffusersGenerator:
 
             kwargs["image"] = load_image(str(image_path))
         return self._filter_supported_kwargs(pipe, kwargs)
+
+    def _emit_progress(self, progress: ProgressCallback | None, phase: str, metadata: dict[str, Any]) -> None:
+        if progress is None:
+            return
+        progress(phase, metadata)
 
     def _build_condition_frame_kwargs(
         self,

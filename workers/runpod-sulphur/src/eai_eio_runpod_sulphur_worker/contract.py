@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypedDict, cast
@@ -15,6 +16,7 @@ from eai_eio_runpod_sulphur_worker.config import WorkerConfig, load_config
 from eai_eio_runpod_sulphur_worker.output_store import publish_video
 
 VideoMode = Literal["text_to_video", "image_to_video", "first_last_frame_to_video", "multi_keyframe_to_video"]
+ProgressCallback = Callable[[str, dict[str, Any]], None]
 WORKER_CONTRACT_VERSION = "eai-eio-runpod-sulphur-v3"
 MODEL_DIMENSION_MULTIPLE = 32
 MIN_MODEL_DIMENSION = 64
@@ -63,23 +65,35 @@ class VideoGenerator(Protocol):
         first_frame_path: Path | None = None,
         middle_frame_path: Path | None = None,
         last_frame_path: Path | None = None,
+        progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         ...
 
 
-def handle_job(job: dict[str, Any], generator: VideoGenerator | None = None, config: WorkerConfig | None = None) -> WorkerOutput:
+_DEFAULT_GENERATOR: VideoGenerator | None = None
+
+
+def handle_job(
+    job: dict[str, Any],
+    generator: VideoGenerator | None = None,
+    config: WorkerConfig | None = None,
+    progress: ProgressCallback | None = None,
+) -> WorkerOutput:
     started_at = time.perf_counter()
     resolved_config = config or load_config()
+    _emit_progress(progress, "validating_input")
     request = parse_worker_input(job.get("input"), resolved_config)
     resolved_config.output_dir.mkdir(parents=True, exist_ok=True)
     output_path = resolved_config.output_dir / f"eai_eio_runpod_{uuid.uuid4().hex}.mp4"
 
     with tempfile.TemporaryDirectory(prefix="eai-eio-input-") as temp_dir:
+        _emit_progress(progress, "preparing_inputs", {"mode": request.mode})
         image_path = write_image_payload(request.image, Path(temp_dir), "image") if request.image else None
         first_frame_path = write_image_payload(request.first_frame, Path(temp_dir), "first-frame") if request.first_frame else None
         middle_frame_path = write_image_payload(request.middle_frame, Path(temp_dir), "middle-frame") if request.middle_frame else None
         last_frame_path = write_image_payload(request.last_frame, Path(temp_dir), "last-frame") if request.last_frame else None
         resolved_generator = generator or _load_default_generator()
+        _emit_progress(progress, "starting_generator", {"mode": request.mode, "model_id": request.model_id})
         generation_metadata = resolved_generator.generate(
             request,
             image_path,
@@ -87,11 +101,13 @@ def handle_job(job: dict[str, Any], generator: VideoGenerator | None = None, con
             first_frame_path=first_frame_path,
             middle_frame_path=middle_frame_path,
             last_frame_path=last_frame_path,
+            progress=progress,
         )
 
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise RuntimeError("Video generator finished without writing a non-empty mp4.")
 
+    _emit_progress(progress, "publishing_output", {"output_mode": resolved_config.output_mode})
     published = publish_video(output_path, config=resolved_config)
     return {
         **published,
@@ -237,6 +253,16 @@ def _float_range(value: object, key: str, *, minimum: float, maximum: float) -> 
 
 
 def _load_default_generator() -> VideoGenerator:
+    global _DEFAULT_GENERATOR
+    if _DEFAULT_GENERATOR is not None:
+        return _DEFAULT_GENERATOR
     from eai_eio_runpod_sulphur_worker.ltx_diffusers import LtxDiffusersGenerator
 
-    return LtxDiffusersGenerator()
+    _DEFAULT_GENERATOR = LtxDiffusersGenerator()
+    return _DEFAULT_GENERATOR
+
+
+def _emit_progress(progress: ProgressCallback | None, phase: str, metadata: dict[str, Any] | None = None) -> None:
+    if progress is None:
+        return
+    progress(phase, metadata or {})

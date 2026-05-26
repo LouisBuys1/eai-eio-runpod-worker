@@ -14,6 +14,8 @@ DEFAULT_MODEL_ID = "diffusers/LTX-2.3-Distilled-Diffusers"
 class WorkerConfig:
     default_model_id: str
     model_cache_dir: Path
+    persistent_model_cache_dir: Path
+    runpod_cached_model_hub: Path
     output_dir: Path
     output_mode: str
     s3_endpoint_url: str
@@ -36,6 +38,8 @@ def load_config() -> WorkerConfig:
     return WorkerConfig(
         default_model_id=os.environ.get("EAI_EIO_DEFAULT_MODEL_ID", DEFAULT_MODEL_ID).strip() or DEFAULT_MODEL_ID,
         model_cache_dir=Path(os.environ.get("EAI_EIO_MODEL_CACHE_DIR", "/workspace/models")).expanduser(),
+        persistent_model_cache_dir=Path(os.environ.get("EAI_EIO_PERSISTENT_MODEL_CACHE_DIR", "/runpod-volume/eai-eio-models")).expanduser(),
+        runpod_cached_model_hub=Path(os.environ.get("EAI_EIO_RUNPOD_CACHED_MODEL_HUB", "/runpod-volume/huggingface-cache/hub")).expanduser(),
         output_dir=Path(os.environ.get("EAI_EIO_OUTPUT_DIR", "/workspace/outputs")).expanduser(),
         output_mode=os.environ.get("EAI_EIO_OUTPUT_MODE", "auto").strip().lower() or "auto",
         s3_endpoint_url=os.environ.get("S3_ENDPOINT_URL", "").strip(),

@@ -5,7 +5,7 @@ RunPod Serverless worker for EAI-EIO cloud video generation. This worker impleme
 ## Runtime
 
 - GPU: NVIDIA CUDA, recommended 48 GB+ VRAM for 1280×720 clips.
-- Model: defaults to `SulphurAI/Sulphur-2-base`; override per request or with `EAI_EIO_DEFAULT_MODEL_ID`.
+- Model: defaults to `diffusers/LTX-2.3-Distilled-Diffusers`; override per request or with `EAI_EIO_DEFAULT_MODEL_ID`.
 - GPU target metadata: EAI-EIO sends `gpu_type_id` from the Settings dropdown for logging and cost estimates. Configure the RunPod endpoint itself with the matching GPU pool.
 - Output: uploads to S3-compatible storage when configured, otherwise returns base64 video bytes for smoke tests.
 
@@ -15,6 +15,8 @@ RunPod Serverless worker for EAI-EIO cloud video generation. This worker impleme
 | --- | --- |
 | `EAI_EIO_DEFAULT_MODEL_ID` | Default Hugging Face model ID. |
 | `EAI_EIO_MODEL_CACHE_DIR` | Optional model cache path. |
+| `EAI_EIO_PERSISTENT_MODEL_CACHE_DIR` | Preferred cache path when `/runpod-volume` is mounted. |
+| `EAI_EIO_RUNPOD_CACHED_MODEL_HUB` | RunPod cached-model Hugging Face hub path. |
 | `EAI_EIO_OUTPUT_MODE` | `auto`, `s3`, or `base64`. Default: `auto`. |
 | `S3_ENDPOINT_URL` | Optional S3/R2 endpoint URL. |
 | `S3_BUCKET` | Bucket for generated videos. |

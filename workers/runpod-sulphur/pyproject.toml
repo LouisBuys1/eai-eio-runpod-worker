@@ -7,6 +7,7 @@ dependencies = [
   "accelerate>=1.2.0",
   "boto3>=1.35.0",
   "diffusers>=0.38.0",
+  "hf_transfer>=0.1.9",
   "huggingface-hub>=0.27.0",
   "imageio[ffmpeg]>=2.36.0",
   "pillow>=11.0.0",

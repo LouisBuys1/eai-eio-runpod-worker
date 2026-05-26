@@ -3,7 +3,14 @@ FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     EAI_EIO_OUTPUT_MODE=auto \
-    EAI_EIO_MODEL_CACHE_DIR=/workspace/models
+    EAI_EIO_MODEL_CACHE_DIR=/runpod-volume/eai-eio-models \
+    EAI_EIO_PERSISTENT_MODEL_CACHE_DIR=/runpod-volume/eai-eio-models \
+    EAI_EIO_RUNPOD_CACHED_MODEL_HUB=/runpod-volume/huggingface-cache/hub \
+    HF_HOME=/runpod-volume/eai-eio-hf \
+    HF_HUB_CACHE=/runpod-volume/eai-eio-models \
+    HF_XET_CACHE=/runpod-volume/eai-eio-xet \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
