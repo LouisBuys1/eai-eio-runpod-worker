@@ -40,5 +40,3 @@ jobs:
           tags: |
             ghcr.io/louisbuys1/eai-eio-runpod-sulphur:latest
             ghcr.io/louisbuys1/eai-eio-runpod-sulphur:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
