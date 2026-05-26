@@ -169,7 +169,17 @@ class LtxDiffusersGenerator:
         return max(valid_snapshots, key=lambda path: path.stat().st_mtime)
 
     def _looks_like_diffusers_snapshot(self, path: Path) -> bool:
-        return path.is_dir() and (path / "model_index.json").exists()
+        if not path.is_dir() or not (path / "model_index.json").exists():
+            return False
+
+        component_config_groups = [
+            (path / "transformer" / "config.json",),
+            (path / "vae" / "config.json",),
+            (path / "scheduler" / "scheduler_config.json", path / "scheduler" / "config.json"),
+            (path / "text_encoder" / "config.json",),
+            (path / "tokenizer" / "tokenizer_config.json", path / "tokenizer" / "vocab.json"),
+        ]
+        return all(any(candidate.exists() for candidate in group) for group in component_config_groups)
 
     def _has_model_cache_artifacts(self, model_cache_dir: Path, model_id: str) -> bool:
         if "/" not in model_id:
