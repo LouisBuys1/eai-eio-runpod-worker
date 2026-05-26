@@ -89,10 +89,16 @@ class LtxDiffusersGenerator:
         os.environ.setdefault("HF_HOME", str(model_cache_dir / "hf-home"))
         os.environ.setdefault("HF_HUB_CACHE", str(model_cache_dir))
         os.environ.setdefault("HF_XET_CACHE", str(model_cache_dir / "xet"))
-        model_ref = self._resolve_cached_snapshot(model_id, config.runpod_cached_model_hub)
+        local_cached_snapshot = self._resolve_cached_snapshot(model_id, model_cache_dir)
+        runpod_cached_snapshot = self._resolve_cached_snapshot(model_id, config.runpod_cached_model_hub)
+        model_ref = local_cached_snapshot or runpod_cached_snapshot
         cache_free_bytes = self._free_bytes(model_cache_dir)
         if model_ref is None:
-            self._ensure_model_cache_has_room(model_cache_dir, cache_free_bytes)
+            self._ensure_model_cache_has_room(
+                model_cache_dir,
+                cache_free_bytes,
+                has_existing_artifacts=self._has_model_cache_artifacts(model_cache_dir, model_id),
+            )
         dtype = torch.bfloat16 if os.environ.get("EAI_EIO_DTYPE", "bfloat16") == "bfloat16" else torch.float16
         pipeline_class = self._pipeline_class_for_model(
             model_id,
@@ -132,7 +138,8 @@ class LtxDiffusersGenerator:
             "model_ref": str(model_ref or model_id),
             "model_cache_dir": str(model_cache_dir),
             "model_cache_free_bytes_at_start": cache_free_bytes,
-            "runpod_cached_model_hit": model_ref is not None,
+            "local_cached_model_hit": local_cached_snapshot is not None,
+            "runpod_cached_model_hit": runpod_cached_snapshot is not None,
         }
 
     def _select_model_cache_dir(self, requested_cache_dir: Path, persistent_cache_dir: Path) -> Path:
@@ -164,13 +171,18 @@ class LtxDiffusersGenerator:
     def _looks_like_diffusers_snapshot(self, path: Path) -> bool:
         return path.is_dir() and (path / "model_index.json").exists()
 
+    def _has_model_cache_artifacts(self, model_cache_dir: Path, model_id: str) -> bool:
+        if "/" not in model_id:
+            return False
+        return (model_cache_dir / f"models--{model_id.replace('/', '--')}").exists()
+
     def _free_bytes(self, path: Path) -> int | None:
         try:
             return shutil.disk_usage(str(path)).free
         except Exception:
             return None
 
-    def _ensure_model_cache_has_room(self, model_cache_dir: Path, free_bytes: int | None) -> None:
+    def _ensure_model_cache_has_room(self, model_cache_dir: Path, free_bytes: int | None, *, has_existing_artifacts: bool) -> None:
         default_min_free_gb = str(MIN_MODEL_CACHE_FREE_BYTES / (1024 ** 3))
         min_free_bytes = int(
             float(os.environ.get("EAI_EIO_MIN_MODEL_CACHE_FREE_GB", default_min_free_gb))
@@ -179,6 +191,8 @@ class LtxDiffusersGenerator:
             * 1024
         )
         if free_bytes is None or free_bytes >= min_free_bytes:
+            return
+        if has_existing_artifacts:
             return
         raise RuntimeError(
             f"Model cache path {model_cache_dir} has {free_bytes / (1024 ** 3):.1f} GiB free; "
